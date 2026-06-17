@@ -3,144 +3,175 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>FIFA Live — Football Updates</title>
+  <title>FIFA Live — Football Intelligence</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300;0,14..32,400;0,14..32,500;0,14..32,600;0,14..32,700;0,14..32,800;0,14..32,900&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
 
-  <!-- ── HEADER ──────────────────────────────────────────────── -->
+  <!-- ══ HEADER ════════════════════════════════════════════════ -->
   <header class="site-header">
     <div class="header-inner">
       <div class="brand">
-        <svg class="brand-icon" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <circle cx="16" cy="16" r="13" stroke="white" stroke-width="1.5"/>
-          <path d="M16 5 C16 5 19.5 8 22 10 C23.5 11 25 11.5 26 13 C26.5 14 26.5 15 26 16.5 C25 19 22 21 21 22.5 C20 24 20 25.5 18.5 26.5 C17.5 27 16 27 16 27 C16 27 14.5 27 13.5 26.5 C12 25.5 12 24 11 22.5 C10 21 7 19 6 16.5 C5.5 15 5.5 14 6 13 C7 11.5 8.5 11 10 10 C12.5 8 16 5 16 5Z" fill="white" opacity="0.15"/>
-          <circle cx="16" cy="13" r="3" fill="white" opacity="0.9"/>
-          <path d="M10 10 L14 13 M22 10 L18 13 M16 16 L16 21 M11 22.5 L14.5 19 M21 22.5 L17.5 19" stroke="white" stroke-width="1.2" stroke-linecap="round"/>
+        <!-- Football icon -->
+        <svg class="brand-icon" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+          <circle cx="14" cy="14" r="12.5" stroke="white" stroke-width="1.5"/>
+          <path d="M14 5.5 L17 10 L22.5 10 L18.5 14.5 L20 20 L14 17 L8 20 L9.5 14.5 L5.5 10 L11 10 Z"
+                fill="white" opacity="0.9"/>
         </svg>
         <span class="brand-name">FIFA<span class="brand-accent"> Live</span></span>
       </div>
-      <button id="refresh-btn" class="refresh-btn" aria-label="Refresh live data">
-        <svg id="spinner" class="icon-spin hidden" viewBox="0 0 20 20" fill="none">
-          <circle cx="10" cy="10" r="8" stroke="currentColor" stroke-width="2" stroke-dasharray="40" stroke-dashoffset="12" stroke-linecap="round"/>
-        </svg>
-        <svg id="refresh-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M17 2v5h-5M3 18v-5h5"/>
-          <path d="M3.51 9a7 7 0 0 1 11.65-2.9L17 7M3 13l2.84 2.9A7 7 0 0 0 16.49 11"/>
-        </svg>
-        Refresh
-      </button>
+      <div class="header-right">
+        <span id="poll-indicator" class="poll-indicator hidden" aria-live="polite">
+          <span class="poll-dot"></span>Auto-updating
+        </span>
+        <button id="refresh-btn" class="refresh-btn" aria-label="Refresh data">
+          <svg id="spinner" class="icon-spin hidden" viewBox="0 0 20 20" fill="none">
+            <circle cx="10" cy="10" r="8" stroke="currentColor" stroke-width="2"
+                    stroke-dasharray="40" stroke-dashoffset="12" stroke-linecap="round"/>
+          </svg>
+          <svg id="refresh-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M17 2v5h-5M3 18v-5h5"/>
+            <path d="M3.51 9a7 7 0 0 1 11.65-2.9L17 7M3 13l2.84 2.9A7 7 0 0 0 16.49 11"/>
+          </svg>
+          Refresh
+        </button>
+      </div>
     </div>
   </header>
 
-  <!-- ── MAIN ────────────────────────────────────────────────── -->
-  <main>
-    <!-- Error banner -->
+  <!-- ══ LEAGUE RAIL ═══════════════════════════════════════════ -->
+  <nav class="league-rail" aria-label="League selector">
+    <div class="league-rail-inner" id="league-tabs">
+      <!-- Injected by JS -->
+    </div>
+  </nav>
+
+  <!-- ══ MAIN ══════════════════════════════════════════════════ -->
+  <main id="main-content">
+
+    <!-- Error -->
     <div id="error-banner" class="error-banner hidden" role="alert"></div>
 
-    <!-- Hero scoreboard -->
-    <section id="scoreboard-section" class="scoreboard-section hidden">
-      <div class="scoreboard-card">
-        <div class="score-meta">
-          <span class="live-chip">
-            <span class="live-dot"></span>LIVE
-          </span>
-          <span id="match-time" class="score-time"></span>
-          <span id="match-status" class="score-status"></span>
-        </div>
-
-        <div class="score-row">
-          <div class="team-col home-col">
-            <div class="team-emblem home-emblem">
-              <svg viewBox="0 0 36 36" fill="none"><circle cx="18" cy="18" r="17" fill="rgba(255,255,255,0.08)" stroke="rgba(255,255,255,0.2)" stroke-width="1"/><text x="18" y="23" text-anchor="middle" font-size="15" fill="white" font-family="Inter,sans-serif">🏠</text></svg>
-            </div>
-            <span id="home-team" class="team-name">—</span>
-          </div>
-
-          <div class="score-col">
-            <div class="score-display">
-              <span id="home-score" class="score-digit">—</span>
-              <span class="score-colon">:</span>
-              <span id="away-score" class="score-digit">—</span>
-            </div>
-          </div>
-
-          <div class="team-col away-col">
-            <div class="team-emblem away-emblem">
-              <svg viewBox="0 0 36 36" fill="none"><circle cx="18" cy="18" r="17" fill="rgba(255,255,255,0.08)" stroke="rgba(255,255,255,0.2)" stroke-width="1"/><text x="18" y="23" text-anchor="middle" font-size="15" fill="white" font-family="Inter,sans-serif">✈️</text></svg>
-            </div>
-            <span id="away-team" class="team-name">—</span>
-          </div>
-        </div>
-
-        <div class="score-footer">
-          <span class="score-source-label">Via BBC Sport</span>
-          <a href="https://www.bbc.com/sport/football/live/cp36z3qpzrxt" target="_blank" rel="noopener" class="score-source-link">
-            Open full coverage ↗
-          </a>
-        </div>
+    <!-- ── FIXTURES ─────────────────────────────────────────── -->
+    <section id="fixtures-section" class="section">
+      <div class="section-header">
+        <h2 class="section-title" id="fixtures-title">Today's Fixtures</h2>
+        <span id="fixtures-meta" class="section-meta"></span>
+      </div>
+      <div id="fixtures-grid" class="fixtures-grid">
+        <!-- Skeleton -->
+        <div class="fixture-skel"><div class="fs-team s-block"></div><div class="fs-score s-block"></div><div class="fs-team s-block"></div></div>
+        <div class="fixture-skel"><div class="fs-team s-block"></div><div class="fs-score s-block"></div><div class="fs-team s-block"></div></div>
+        <div class="fixture-skel"><div class="fs-team s-block"></div><div class="fs-score s-block"></div><div class="fs-team s-block"></div></div>
       </div>
     </section>
 
-    <!-- No match fallback title -->
-    <div id="page-title-bar" class="page-title-bar hidden">
-      <div class="pitch-stripe"></div>
-      <h2 id="page-title-text" class="page-title-text"></h2>
-    </div>
+    <!-- ── MATCH DETAIL (hidden until a match is selected) ──── -->
+    <div id="match-detail" class="hidden">
 
-    <!-- Feed header -->
-    <div id="feed-header" class="feed-header hidden">
-      <span id="update-count" class="update-count"></span>
-      <span class="feed-label">LIVE COMMENTARY</span>
-    </div>
+      <!-- Scoreboard hero -->
+      <section class="scoreboard-section">
+        <div class="scoreboard-card">
+          <div class="score-meta">
+            <span class="live-chip hidden" id="live-chip">
+              <span class="live-dot"></span>LIVE
+            </span>
+            <span id="match-clock" class="score-time"></span>
+            <span id="match-status-detail" class="score-status"></span>
+            <span id="league-badge" class="league-badge"></span>
+          </div>
+          <div class="score-row">
+            <div class="team-col home-col">
+              <img id="home-logo" class="team-logo" src="" alt="" aria-hidden="true" />
+              <span id="home-team" class="team-name">—</span>
+            </div>
+            <div class="score-col">
+              <div class="score-display">
+                <span id="home-score" class="score-digit">—</span>
+                <span class="score-colon">:</span>
+                <span id="away-score" class="score-digit">—</span>
+              </div>
+            </div>
+            <div class="team-col away-col">
+              <img id="away-logo" class="team-logo" src="" alt="" aria-hidden="true" />
+              <span id="away-team" class="team-name">—</span>
+            </div>
+          </div>
+          <div class="score-footer">
+            <span class="score-source-label">Powered by ESPN</span>
+            <span id="last-updated" class="score-updated"></span>
+          </div>
+        </div>
+      </section>
 
-    <!-- Skeleton placeholders shown during load -->
-    <div id="skeleton-container" class="commentary-feed">
-      <div class="skel-card"><div class="skel-time s-block"></div><div><div class="skel-l1 s-block"></div><div class="skel-l2 s-block"></div><div class="skel-l3 s-block"></div></div></div>
-      <div class="skel-card"><div class="skel-time s-block"></div><div><div class="skel-l1 s-block"></div><div class="skel-l2 s-block"></div></div></div>
-      <div class="skel-card"><div class="skel-time s-block"></div><div><div class="skel-l1 s-block"></div><div class="skel-l2 s-block"></div><div class="skel-l3 s-block"></div></div></div>
-      <div class="skel-card"><div class="skel-time s-block"></div><div><div class="skel-l1 s-block"></div><div class="skel-l2 s-block"></div></div></div>
-      <div class="skel-card"><div class="skel-time s-block"></div><div><div class="skel-l1 s-block"></div><div class="skel-l2 s-block"></div><div class="skel-l3 s-block"></div></div></div>
-    </div>
+      <!-- Stats strip -->
+      <section id="stats-section" class="stats-section hidden">
+        <div id="stats-strip" class="stats-strip"></div>
+      </section>
 
-    <!-- Commentary feed -->
-    <div id="commentary-feed" class="commentary-feed hidden"></div>
+      <!-- Key Events + Commentary -->
+      <div class="detail-grid">
+
+        <!-- Key Events -->
+        <section id="key-events-section" class="key-events-section hidden">
+          <h3 class="col-heading">Key Events</h3>
+          <div id="key-events-list" class="key-events-list" aria-live="polite"></div>
+        </section>
+
+        <!-- Commentary -->
+        <section id="commentary-section" class="commentary-section">
+          <div class="col-heading-row">
+            <h3 class="col-heading">Live Commentary</h3>
+            <span id="commentary-count" class="commentary-count"></span>
+          </div>
+          <div id="commentary-feed" class="commentary-feed" aria-live="polite">
+            <!-- Injected by JS -->
+          </div>
+        </section>
+
+      </div>
+    </div><!-- /match-detail -->
+
   </main>
 
-  <!-- ── TWEET MODAL ──────────────────────────────────────────── -->
-  <div id="tweet-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <!-- ══ TWEET MODAL ═══════════════════════════════════════════ -->
+  <div id="tweet-modal" class="modal-backdrop hidden"
+       role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <div class="modal-card">
       <div class="modal-top">
         <h2 id="modal-title" class="modal-heading">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
             <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-4.714-6.231-5.401 6.231H2.747l7.73-8.835L1.254 2.25H8.08l4.253 5.622 5.911-5.622zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
           </svg>
           Post to X
         </h2>
-        <button class="modal-close-btn" id="modal-close" aria-label="Close modal">
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-            <path d="M1 1l12 12M13 1L1 13"/>
+        <button class="modal-close-btn" id="modal-close" aria-label="Close">
+          <svg width="12" height="12" viewBox="0 0 12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M1 1l10 10M11 1L1 11"/>
           </svg>
         </button>
       </div>
-      <textarea id="tweet-text" class="tweet-textarea" maxlength="280" rows="5" placeholder="What's happening?"></textarea>
+      <textarea id="tweet-text" class="tweet-textarea" maxlength="280" rows="5"
+                placeholder="What's happening?"></textarea>
       <div class="modal-bottom">
         <div class="char-wrap">
-          <svg viewBox="0 0 36 36" width="28" height="28">
+          <svg viewBox="0 0 36 36" width="28" height="28" aria-hidden="true">
             <circle cx="18" cy="18" r="16" fill="none" stroke="#e8e8ed" stroke-width="3"/>
-            <circle id="char-ring" cx="18" cy="18" r="16" fill="none" stroke="#0071e3" stroke-width="3"
-              stroke-dasharray="100.5" stroke-dashoffset="0" stroke-linecap="round"
-              transform="rotate(-90 18 18)" style="transition:stroke-dashoffset .1s,stroke .1s"/>
+            <circle id="char-ring" cx="18" cy="18" r="16" fill="none"
+                    stroke="#0071e3" stroke-width="3"
+                    stroke-dasharray="100.5" stroke-dashoffset="0"
+                    stroke-linecap="round" transform="rotate(-90 18 18)"/>
           </svg>
           <span id="char-count" class="char-num">280</span>
         </div>
         <div class="modal-btns">
           <button class="btn-cancel" id="modal-cancel">Cancel</button>
           <button class="btn-post" id="modal-post">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
               <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-4.714-6.231-5.401 6.231H2.747l7.73-8.835L1.254 2.25H8.08l4.253 5.622 5.911-5.622zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
             </svg>
             Post

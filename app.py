@@ -1,234 +1,263 @@
+"""
+FIFA Live — Flask backend powered by ESPN's public soccer API.
+
+Product:   Real-time football scores, commentary, key events and stats
+           across 10+ leagues. No API key required.
+Process:   Client polls /api/scoreboard/<league> to list fixtures, then
+           /api/match/<league>/<id> for full match detail. Server caches
+           every ESPN response to stay well within rate limits.
+Performance: Live-match cache TTL 20 s, pre/post-match 300 s.
+           Target <50 ms from cache, <900 ms cold. Zero framework overhead.
+"""
+
 from flask import Flask, render_template, jsonify
 import requests
-from bs4 import BeautifulSoup
-import json
-import re
-from datetime import datetime, timezone
+import threading
+import time
 
 app = Flask(__name__)
 
-BBC_URL = "https://www.bbc.com/sport/football/live/cp36z3qpzrxt"
+# ── ESPN endpoints ────────────────────────────────────────────────
+ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
 
-HEADERS = {
+LEAGUES = {
+    "fifa.world":     "FIFA World Cup 2026",
+    "eng.1":          "Premier League",
+    "esp.1":          "La Liga",
+    "ger.1":          "Bundesliga",
+    "ita.1":          "Serie A",
+    "fra.1":          "Ligue 1",
+    "uefa.champions": "Champions League",
+    "uefa.europa":    "Europa League",
+    "usa.1":          "MLS",
+    "fifa.friendly":  "Internationals",
+}
+
+# Key stats to surface prominently in the UI
+SURFACE_STATS = [
+    "POSSESSION", "SHOTS", "ON GOAL",
+    "Corner Kicks", "Yellow Cards", "Red Cards",
+    "Saves", "Fouls",
+]
+
+ESPN_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-GB,en;q=0.9",
+    "Accept": "application/json",
 }
 
-
-# ── Helpers ─────────────────────────────────────────────────────────────────
-
-def to_sentences(text, n=4):
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    parts = [p.strip() for p in parts if len(p.strip()) > 8]
-    return " ".join(parts[:n])
+# ── In-memory cache ───────────────────────────────────────────────
+_cache: dict = {}
+_lock = threading.Lock()
 
 
-def fmt_time(ts):
-    if not ts:
-        return ""
-    if isinstance(ts, (int, float)):
-        try:
-            dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
-            return dt.strftime("%H:%M")
-        except Exception:
-            return ""
-    ts = str(ts)
-    if "T" in ts or ts.endswith("Z"):
-        try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            return dt.strftime("%H:%M")
-        except Exception:
-            pass
-    m = re.match(r"\d{1,2}:\d{2}", ts)
-    return m.group() if m else ts[:8]
+def cached(key: str, ttl: int, fetch):
+    """Return (data, from_cache). Calls fetch() on a miss."""
+    now = time.monotonic()
+    with _lock:
+        hit = _cache.get(key)
+        if hit and now - hit["t"] < ttl:
+            return hit["d"], True
+    data = fetch()
+    with _lock:
+        _cache[key] = {"d": data, "t": time.monotonic()}
+    return data, False
 
 
-# ── JSON recursive walker ────────────────────────────────────────────────────
-
-def walk(obj, c, depth=0):
-    """Recursively mine __NEXT_DATA__ for match info and commentary."""
-    if depth > 15 or not isinstance(obj, (dict, list)):
-        return
-
-    if isinstance(obj, list):
-        for item in obj:
-            walk(item, c, depth + 1)
-        return
-
-    t = str(obj.get("type") or obj.get("componentType") or "").upper()
-
-    # ── Score detection ──────────────────────────────────────────
-    if not c["match"]:
-        home = obj.get("homeTeam") or obj.get("home") or {}
-        away = obj.get("awayTeam") or obj.get("away") or {}
-        if isinstance(home, dict) and isinstance(away, dict):
-            hn = home.get("name") or home.get("fullName") or home.get("abbr") or ""
-            an = away.get("name") or away.get("fullName") or away.get("abbr") or ""
-            if hn and an:
-                c["match"] = {
-                    "home_team": hn,
-                    "away_team": an,
-                    "home_score": home.get("score", home.get("goals", "?")),
-                    "away_score": away.get("score", away.get("goals", "?")),
-                    "time": str(obj.get("time") or obj.get("minute") or obj.get("matchTime") or ""),
-                    "status": str(obj.get("status") or obj.get("state") or "LIVE"),
-                }
-
-    # ── Post detection ───────────────────────────────────────────
-    if any(k in t for k in ("POST", "UPDATE", "ITEM", "ARTICLE", "ENTRY", "LIVEBLOG")):
-        text = deep_text(obj)
-        if len(text.strip()) > 30:
-            ts = (
-                obj.get("publishedAt") or obj.get("timestamp") or
-                obj.get("time") or obj.get("updated") or ""
-            )
-            label = obj.get("label") or obj.get("minute") or obj.get("matchTime") or ""
-            is_key = bool(
-                obj.get("isKeyEvent") or obj.get("isKeyMoment") or
-                obj.get("isPinned") or obj.get("pinned") or obj.get("important")
-            )
-            c["commentary"].append({
-                "time": fmt_time(ts) or str(label),
-                "text": to_sentences(text, 4),
-                "is_key": is_key,
-            })
-            return  # don't recurse into already-processed posts
-
-    for v in obj.values():
-        walk(v, c, depth + 1)
+def espn(path: str) -> dict:
+    r = requests.get(f"{ESPN_BASE}/{path}", headers=ESPN_HEADERS, timeout=10)
+    r.raise_for_status()
+    return r.json()
 
 
-def deep_text(obj, depth=0):
-    if depth > 10:
-        return ""
-    if isinstance(obj, str):
-        return re.sub(r"<[^>]+>", " ", obj)
-    if isinstance(obj, list):
-        return " ".join(deep_text(x, depth + 1) for x in obj if x)
+# ── Helpers ───────────────────────────────────────────────────────
+
+def _competitor(competitors: list, side: str) -> dict:
+    """Pull the home or away competitor dict."""
+    return next(
+        (c for c in competitors if c.get("homeAway") == side),
+        competitors[0] if side == "home" else competitors[-1],
+    )
+
+
+def _team_shape(c: dict) -> dict:
+    t = c["team"]
+    return {
+        "name":  t.get("displayName", ""),
+        "short": t.get("abbreviation", ""),
+        "logo":  t.get("logo", ""),
+        "score": c.get("score", ""),
+    }
+
+
+def _clock_str(obj) -> str:
     if isinstance(obj, dict):
-        for key in ("text", "value", "body", "content", "description", "summary", "paragraph", "html"):
-            v = obj.get(key)
-            if v:
-                result = deep_text(v, depth + 1).strip()
-                if result:
-                    return result
-        return " ".join(
-            deep_text(v, depth + 1) for v in obj.values()
-            if v and not isinstance(v, (bool, int, float))
-        )
-    return ""
+        return obj.get("displayValue", "")
+    return str(obj) if obj else ""
 
 
-# ── HTML fallback ────────────────────────────────────────────────────────────
-
-def parse_html(soup):
-    c = {"match": None, "commentary": []}
-
-    # Try score header
-    for testid_pat in [r"match-score", r"fixture", r"score-block"]:
-        score_el = soup.find(attrs={"data-testid": re.compile(testid_pat, re.I)})
-        if score_el:
-            teams = score_el.find_all(class_=re.compile(r"team", re.I))
-            nums = score_el.find_all(class_=re.compile(r"number|score|goal", re.I))
-            if len(teams) >= 2 and len(nums) >= 2:
-                c["match"] = {
-                    "home_team": teams[0].get_text(strip=True),
-                    "away_team": teams[1].get_text(strip=True),
-                    "home_score": nums[0].get_text(strip=True),
-                    "away_score": nums[1].get_text(strip=True),
-                    "time": "", "status": "LIVE",
-                }
-                break
-
-    # Find posts — try several selectors in order of specificity
-    posts = []
-    for selector in [
-        lambda s: s.find_all(attrs={"data-testid": re.compile(r"live[-_]?post|stream[-_]?post", re.I)}),
-        lambda s: s.find_all(attrs={"data-component": re.compile(r"lx-stream|live|sport-post", re.I)}),
-        lambda s: s.find_all(class_=re.compile(r"lx-stream__post|stream-post|live-post", re.I)),
-        lambda s: s.find_all("article"),
-    ]:
-        posts = selector(soup)
-        if posts:
-            break
-
-    for post in posts[:30]:
-        time_el = (
-            post.find("time") or
-            post.find(attrs={"data-testid": re.compile(r"time|stamp", re.I)}) or
-            post.find(class_=re.compile(r"timestamp|time-stamp", re.I))
-        )
-        ts = ""
-        if time_el:
-            ts = time_el.get("datetime", "") or time_el.get_text(strip=True)
-
-        paras = post.find_all(["p", "h2", "h3", "li"])
-        raw = " ".join(el.get_text(" ", strip=True) for el in paras)
-        text = re.sub(r"\s+", " ", raw).strip()
-
-        if len(text) < 20:
-            continue
-
-        c["commentary"].append({
-            "time": fmt_time(ts),
-            "text": to_sentences(text, 4),
-            "is_key": False,
-        })
-
-    return c
+def _poll_interval(state: str) -> int:
+    return {"in": 20, "pre": 300}.get(state, 300)
 
 
-# ── Routes ───────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
     return render_template("index.html")
 
 
-@app.route("/api/football")
-def football():
+@app.route("/api/leagues")
+def leagues_route():
+    return jsonify({
+        "leagues": [{"id": k, "name": v} for k, v in LEAGUES.items()]
+    })
+
+
+@app.route("/api/scoreboard/<league>")
+def scoreboard(league: str):
+    if league not in LEAGUES:
+        return jsonify({"error": "Unknown league"}), 400
+
     try:
-        resp = requests.get(BBC_URL, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
+        raw, from_cache = cached(
+            f"sb:{league}", ttl=30,
+            fetch=lambda: espn(f"{league}/scoreboard"),
+        )
     except requests.RequestException as e:
-        return jsonify({"error": str(e), "match": None, "commentary": []}), 502
+        return jsonify({"error": str(e)}), 502
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    c = {"match": None, "commentary": []}
+    events = []
+    for ev in raw.get("events", []):
+        comp       = ev["competitions"][0]
+        status     = ev["status"]
+        state      = status["type"]["state"]          # pre / in / post
+        home       = _team_shape(_competitor(comp["competitors"], "home"))
+        away       = _team_shape(_competitor(comp["competitors"], "away"))
 
-    # 1. __NEXT_DATA__ (primary)
-    script = soup.find("script", id="__NEXT_DATA__")
-    if script and script.string:
-        try:
-            walk(json.loads(script.string), c)
-        except json.JSONDecodeError:
-            pass
+        events.append({
+            "id":            ev["id"],
+            "name":          ev["name"],
+            "state":         state,
+            "clock":         status.get("displayClock", ""),
+            "period":        status.get("period", 0),
+            "status_detail": status["type"].get("shortDetail", ""),
+            "home":          home,
+            "away":          away,
+        })
 
-    # 2. Other embedded JSON blobs
-    if not c["commentary"]:
-        for s in soup.find_all("script", type="application/json"):
-            try:
-                walk(json.loads(s.string or "{}"), c)
-                if c["commentary"]:
-                    break
-            except json.JSONDecodeError:
-                pass
+    # Live → upcoming → finished
+    _order = {"in": 0, "pre": 1, "post": 2}
+    events.sort(key=lambda e: _order.get(e["state"], 9))
+    any_live = any(e["state"] == "in" for e in events)
 
-    # 3. HTML fallback
-    if not c["commentary"]:
-        c = parse_html(soup)
+    return jsonify({
+        "league":        league,
+        "league_name":   LEAGUES[league],
+        "events":        events,
+        "cached":        from_cache,
+        "poll_interval": 15 if any_live else 300,
+    })
 
-    title_el = soup.find("title")
-    c["page_title"] = title_el.get_text(strip=True) if title_el else "Live Football"
-    c["source_url"] = BBC_URL
-    return jsonify(c)
+
+@app.route("/api/match/<league>/<event_id>")
+def match_detail(league: str, event_id: str):
+    if league not in LEAGUES:
+        return jsonify({"error": "Unknown league"}), 400
+
+    try:
+        raw, from_cache = cached(
+            f"match:{league}:{event_id}", ttl=20,
+            fetch=lambda: espn(f"{league}/summary?event={event_id}"),
+        )
+    except requests.RequestException as e:
+        return jsonify({"error": str(e)}), 502
+
+    # ── Score header ──────────────────────────────────────────────
+    hcomp   = raw["header"]["competitions"][0]
+    state   = hcomp["status"]["type"]["state"]
+    home    = _team_shape(_competitor(hcomp["competitors"], "home"))
+    away    = _team_shape(_competitor(hcomp["competitors"], "away"))
+
+    match = {
+        "id":            event_id,
+        "state":         state,
+        "clock":         hcomp["status"].get("displayClock", ""),
+        "period":        hcomp["status"].get("period", 0),
+        "status_detail": hcomp["status"]["type"].get("shortDetail", ""),
+        "home":          home,
+        "away":          away,
+    }
+
+    # ── Commentary (newest first) ─────────────────────────────────
+    commentary = []
+    for c in raw.get("commentary", []):
+        text = (c.get("text") or "").strip()
+        if not text:
+            continue
+        commentary.append({
+            "sequence": c.get("sequence", 0),
+            "time":     _clock_str(c.get("clock") or c.get("time", "")),
+            "text":     text,
+        })
+    commentary.sort(key=lambda x: x["sequence"], reverse=True)
+
+    # ── Key events ────────────────────────────────────────────────
+    key_events = []
+    skip_types = {"Start Delay", "End Delay"}
+    for ke in raw.get("keyEvents", []):
+        ev_type = (ke.get("type") or {}).get("text", "")
+        if ev_type in skip_types:
+            continue
+        text = (ke.get("text") or "").strip()
+        if not text:
+            continue
+        key_events.append({
+            "clock":   _clock_str(ke.get("clock", "")),
+            "type":    ev_type,
+            "text":    text,
+            "is_goal": "Goal" in ev_type or bool(ke.get("scoringPlay")),
+            "is_card": "Card" in ev_type,
+            "is_sub":  "Substitution" in ev_type,
+        })
+
+    # ── Stats ─────────────────────────────────────────────────────
+    teams_stats = []
+    for td in raw.get("boxscore", {}).get("teams", []):
+        lookup = {s["label"]: s["displayValue"] for s in td.get("statistics", [])}
+        teams_stats.append({
+            "team":    td["team"]["displayName"],
+            "is_home": td.get("homeAway", "home") == "home",
+            "stats":   lookup,
+        })
+
+    # Ensure home team is first
+    teams_stats.sort(key=lambda t: 0 if t["is_home"] else 1)
+
+    # Build surface stats rows: [{label, home_val, away_val}]
+    stat_rows = []
+    if len(teams_stats) == 2:
+        home_s = teams_stats[0]["stats"]
+        away_s = teams_stats[1]["stats"]
+        for label in SURFACE_STATS:
+            hv = home_s.get(label, "")
+            av = away_s.get(label, "")
+            if hv or av:
+                stat_rows.append({"label": label, "home": hv, "away": av})
+
+    return jsonify({
+        "match":         match,
+        "commentary":    commentary,
+        "key_events":    key_events,
+        "stat_rows":     stat_rows,
+        "cached":        from_cache,
+        "poll_interval": _poll_interval(state),
+        "league":        league,
+        "league_name":   LEAGUES.get(league, league),
+    })
 
 
 if __name__ == "__main__":
