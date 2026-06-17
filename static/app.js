@@ -1,458 +1,627 @@
-/* ════════════════════════════════════════════════════════════════
-   FIFA Live — Frontend
-   ────────────────────────────────────────────────────────────────
-   Product:     Multi-league live football hub. Select any league,
-                pick a match, get live score + stats + key events +
-                commentary. Tweet any update in one click.
+/* ═══════════════════════════════════════════════════════════════
+   FIFA Live — app.js
+   Drives the OLED redesign: league tabs, fixture strip, match hero,
+   stats/events/commentary panels, incremental commentary, goal toast,
+   tweet modal, auto-polling.
+═══════════════════════════════════════════════════════════════ */
 
-   Process:     1. On load: fetch /api/leagues → render tabs
-                2. On tab select: fetch /api/scoreboard/<league> → fixtures
-                3. On fixture click: fetch /api/match/<league>/<id> → detail
-                4. Auto-poll: setInterval driven by poll_interval from server
-                   (20 s live, 300 s pre/post). Only new commentary appended.
+"use strict";
 
-   Performance: Incremental commentary updates via sequence tracking.
-                No full re-renders on poll. setInterval cleared on
-                league switch or manual refresh to avoid double-polling.
-   ════════════════════════════════════════════════════════════════ */
+// ── State ──────────────────────────────────────────────────────────
+let currentLeague    = "fifa.world";
+let selectedEventId  = null;
+let lastHomeScore    = null;
+let lastAwayScore    = null;
+let lastCommentarySeq = 0;
+let pollTimer        = null;
+let matchPollTimer   = null;
+let isRefreshing     = false;
 
-const TWEET_MAX  = 280;
-const RING_CIRC  = 100.5;
+const MAX_TWEET_CHARS = 280;
+const CIRCUMFERENCE   = 2 * Math.PI * 13; // r=13 on 32×32 SVG ≈ 81.7
 
-/* ── App state ─────────────────────────────────────────────────── */
-let state = {
-  league:          "fifa.world",
-  eventId:         null,
-  eventLeague:     null,
-  pollTimer:       null,
-  lastCommentarySeq: -1,
-  loading:         false,
-};
+// ── DOM refs ───────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
 
-/* ── Helpers ───────────────────────────────────────────────────── */
-const $  = id => document.getElementById(id);
-const el = (tag, cls, text) => {
-  const e = document.createElement(tag);
-  if (cls)  e.className   = cls;
-  if (text) e.textContent = text;
-  return e;
-};
+// ── Init ───────────────────────────────────────────────────────────
+document.addEventListener("DOMContentLoaded", () => {
+  loadLeagues();
+  wireModalEvents();
+  wireTweetTextarea();
+  wireRefreshButton();
+  wireTabBar();
+});
 
-function setLoading(on) {
-  state.loading = on;
-  $("spinner").classList.toggle("hidden", !on);
-  $("refresh-icon").classList.toggle("hidden", on);
-  $("refresh-btn").disabled = on;
-}
+// ═══════════════════════════════════════════════════════════════════
+//  LEAGUES
+// ═══════════════════════════════════════════════════════════════════
 
-function showError(msg) {
-  const b = $("error-banner");
-  b.textContent = "⚠ " + msg;
-  b.classList.remove("hidden");
-}
-function hideError() { $("error-banner").classList.add("hidden"); }
-
-function stamp() {
-  return new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
-}
-
-function stopPolling() {
-  if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
-  $("poll-indicator").classList.add("hidden");
-}
-
-function startPolling(intervalSec) {
-  stopPolling();
-  if (intervalSec >= 300 || !state.eventId) return;
-  $("poll-indicator").classList.remove("hidden");
-  state.pollTimer = setInterval(() => loadMatchDetail(false), intervalSec * 1000);
-}
-
-/* ════════════════════════════════════════════════════════════════
-   LEAGUES
-   ════════════════════════════════════════════════════════════════ */
 async function loadLeagues() {
   try {
-    const data = await fetch("/api/leagues").then(r => r.json());
-    const rail = $("league-tabs");
-    rail.innerHTML = "";
-    data.leagues.forEach(lg => {
-      const btn = el("button", "league-tab", lg.name);
-      btn.setAttribute("aria-label", lg.name);
-      if (lg.id === state.league) btn.classList.add("active");
-      btn.addEventListener("click", () => selectLeague(lg.id, btn));
-      rail.appendChild(btn);
-    });
-  } catch (_) { /* silently skip — tabs just won't render */ }
+    const res  = await fetch("/api/leagues");
+    const data = await res.json();
+    renderLeagueTabs(data.leagues || []);
+    selectLeague(data.leagues?.[0]?.id || "fifa.world");
+  } catch (e) {
+    showError("Could not load leagues — " + e.message);
+  }
 }
 
-function selectLeague(id, btn) {
-  if (id === state.league && !btn) return;
-  document.querySelectorAll(".league-tab").forEach(b => b.classList.remove("active"));
-  if (btn) btn.classList.add("active");
-  state.league    = id;
-  state.eventId   = null;
-  state.eventLeague = null;
-  stopPolling();
+function renderLeagueTabs(leagues) {
+  const rail = $("league-tabs");
+  rail.innerHTML = "";
+  leagues.forEach(league => {
+    const btn = document.createElement("button");
+    btn.className = "league-tab";
+    btn.textContent = league.name;
+    btn.dataset.id  = league.id;
+    btn.setAttribute("role", "tab");
+    btn.setAttribute("aria-selected", "false");
+    btn.addEventListener("click", () => selectLeague(league.id));
+    rail.appendChild(btn);
+  });
+}
+
+function selectLeague(id) {
+  currentLeague   = id;
+  selectedEventId = null;
+  lastCommentarySeq = 0;
+  clearMatchPolling();
+
+  document.querySelectorAll(".league-tab").forEach(btn => {
+    const active = btn.dataset.id === id;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+  });
+
+  $("hero-section").classList.add("hidden");
   $("match-detail").classList.add("hidden");
+  clearError();
   loadScoreboard();
 }
 
-/* ════════════════════════════════════════════════════════════════
-   SCOREBOARD  (fixture list)
-   ════════════════════════════════════════════════════════════════ */
-async function loadScoreboard() {
-  hideError();
-  setLoading(true);
-  showFixtureSkeletons();
+// ═══════════════════════════════════════════════════════════════════
+//  SCOREBOARD
+// ═══════════════════════════════════════════════════════════════════
+
+async function loadScoreboard(silent = false) {
+  if (!silent) showSpinner(true);
+  clearError();
 
   try {
-    const data = await fetch(`/api/scoreboard/${state.league}`).then(r => r.json());
-    if (data.error) { showError(data.error); renderFixtures([]); return; }
+    const res  = await fetch(`/api/scoreboard/${currentLeague}`);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
 
-    $("fixtures-title").textContent = data.league_name + " — Fixtures";
-    const liveCount = data.events.filter(e => e.state === "in").length;
-    $("fixtures-meta").textContent = liveCount > 0
-      ? `${liveCount} live · ${data.events.length} total`
-      : `${data.events.length} fixture${data.events.length !== 1 ? "s" : ""}`;
+    renderFixtureStrip(data);
+    updatePollBadge(data.events?.some(e => e.state === "in"));
 
-    renderFixtures(data.events);
-  } catch (_) {
-    showError("Could not load fixtures.");
-    renderFixtures([]);
+    clearScoreboardPolling();
+    const interval = (data.poll_interval || 300) * 1000;
+    pollTimer = setTimeout(() => loadScoreboard(true), interval);
+  } catch (e) {
+    showError("Scoreboard error — " + e.message);
   } finally {
-    setLoading(false);
+    showSpinner(false);
   }
 }
 
-function showFixtureSkeletons() {
-  $("fixtures-grid").innerHTML = `
-    <div class="fixture-skel"><div class="fs-team s-block"></div><div class="fs-score s-block"></div><div class="fs-team s-block"></div></div>
-    <div class="fixture-skel"><div class="fs-team s-block"></div><div class="fs-score s-block"></div><div class="fs-team s-block"></div></div>
-    <div class="fixture-skel"><div class="fs-team s-block"></div><div class="fs-score s-block"></div><div class="fs-team s-block"></div></div>`;
-}
+function renderFixtureStrip(data) {
+  const strip  = $("fixture-strip");
+  const events = data.events || [];
 
-function renderFixtures(events) {
-  const grid = $("fixtures-grid");
-  grid.innerHTML = "";
+  $("fixtures-league-name").textContent = data.league_name || "";
+  $("fixtures-meta").textContent = events.length
+    ? `${events.length} match${events.length !== 1 ? "es" : ""}`
+    : "No fixtures today";
 
-  if (events.length === 0) {
-    grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1">
-      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
-      <p>No fixtures found for this competition today.</p></div>`;
+  if (!events.length) {
+    strip.innerHTML = `<div class="panel-empty" style="padding:20px 0">No fixtures available for this competition today.</div>`;
     return;
   }
 
+  strip.innerHTML = "";
   events.forEach(ev => {
-    const card = el("div", "fixture-card");
-    if (ev.state === "in")   card.classList.add("live-match");
-    if (ev.id === state.eventId) card.classList.add("active");
-
-    const scoreText  = (ev.state === "pre")
-      ? "vs"
-      : `${ev.home.score} - ${ev.away.score}`;
-    const statusText = ev.state === "in"
-      ? (ev.clock ? ev.clock + "'" : "LIVE")
-      : ev.status_detail || "";
-
-    // Home team column
-    const homeCol = el("div", "fixture-team home");
-    if (ev.home.logo) {
-      const img = document.createElement("img");
-      img.src = ev.home.logo; img.alt = ev.home.short;
-      img.className = "fixture-team-logo"; img.loading = "lazy";
-      homeCol.appendChild(img);
-    }
-    homeCol.appendChild(el("span", "fixture-team-name", ev.home.name));
-
-    // Center
-    const center = el("div", "fixture-center");
-    center.appendChild(el("div", "fixture-score", scoreText));
-    const statusEl = el("div",
-      "fixture-status" + (ev.state === "in" ? " is-live" : ev.state === "pre" ? " is-pre" : ""),
-      statusText
-    );
-    center.appendChild(statusEl);
-
-    // Away team column
-    const awayCol = el("div", "fixture-team away");
-    if (ev.away.logo) {
-      const img = document.createElement("img");
-      img.src = ev.away.logo; img.alt = ev.away.short;
-      img.className = "fixture-team-logo"; img.loading = "lazy";
-      awayCol.appendChild(img);
-    }
-    awayCol.appendChild(el("span", "fixture-team-name", ev.away.name));
-
-    card.appendChild(homeCol);
-    card.appendChild(center);
-    card.appendChild(awayCol);
-
-    card.addEventListener("click", () => {
-      document.querySelectorAll(".fixture-card").forEach(c => c.classList.remove("active"));
-      card.classList.add("active");
-      selectMatch(ev.id, state.league);
-    });
-
-    grid.appendChild(card);
+    const pill = buildFixturePill(ev);
+    strip.appendChild(pill);
   });
 }
 
-/* ════════════════════════════════════════════════════════════════
-   MATCH DETAIL
-   ════════════════════════════════════════════════════════════════ */
-function selectMatch(eventId, league) {
-  stopPolling();
-  state.eventId        = eventId;
-  state.eventLeague    = league;
-  state.lastCommentarySeq = -1;
-  $("match-detail").classList.remove("hidden");
-  $("commentary-feed").innerHTML = "";
-  $("key-events-list").innerHTML = "";
-  $("stats-section").classList.add("hidden");
-  $("key-events-section").classList.add("hidden");
-  loadMatchDetail(true);
-  $("match-detail").scrollIntoView({ behavior: "smooth", block: "start" });
+function buildFixturePill(ev) {
+  const isLive   = ev.state === "in";
+  const isPre    = ev.state === "pre";
+  const hasScore = ev.home.score !== "" && ev.away.score !== "";
+
+  const pill = document.createElement("div");
+  pill.className = "fx-pill" + (isLive ? " is-live" : "");
+  pill.setAttribute("role", "listitem");
+  pill.setAttribute("tabindex", "0");
+  pill.dataset.eventId = ev.id;
+  pill.setAttribute("aria-label",
+    `${ev.home.name} vs ${ev.away.name}${hasScore ? `, score ${ev.home.score}-${ev.away.score}` : ""}`
+  );
+  if (ev.id === selectedEventId) pill.classList.add("active");
+
+  const teams = document.createElement("div");
+  teams.className = "fx-teams";
+  teams.innerHTML = `
+    <span>${escHtml(ev.home.short || ev.home.name)}</span>
+    <span class="fx-vs">vs</span>
+    <span>${escHtml(ev.away.short || ev.away.name)}</span>
+  `;
+
+  const bottom = document.createElement("div");
+  bottom.className = "fx-bottom";
+
+  const score = document.createElement("span");
+  score.className = "fx-score";
+  score.textContent = hasScore ? `${ev.home.score} – ${ev.away.score}` : "– – –";
+
+  const status = document.createElement("span");
+  status.className = "fx-status" + (isLive ? " live" : isPre ? " pre" : "");
+  if (isLive && ev.clock) {
+    status.textContent = ev.clock + "'";
+  } else {
+    status.textContent = isLive ? "LIVE" : isPre ? (ev.status_detail || "Upcoming") : "FT";
+  }
+
+  bottom.appendChild(score);
+  bottom.appendChild(status);
+  pill.appendChild(teams);
+  pill.appendChild(bottom);
+
+  pill.addEventListener("click", () => selectMatch(ev.id));
+  pill.addEventListener("keydown", e => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectMatch(ev.id); }
+  });
+
+  return pill;
 }
 
-async function loadMatchDetail(isFirstLoad = false) {
-  if (!state.eventId) return;
-  if (isFirstLoad) setLoading(true);
-  hideError();
+// ═══════════════════════════════════════════════════════════════════
+//  MATCH DETAIL
+// ═══════════════════════════════════════════════════════════════════
+
+function selectMatch(id) {
+  selectedEventId   = id;
+  lastCommentarySeq = 0;
+  lastHomeScore     = null;
+  lastAwayScore     = null;
+
+  document.querySelectorAll(".fx-pill").forEach(p => {
+    p.classList.toggle("active", p.dataset.eventId === id);
+  });
+
+  clearMatchPolling();
+  loadMatchDetail();
+}
+
+async function loadMatchDetail(silent = false) {
+  if (!selectedEventId) return;
+  if (!silent) showSpinner(true);
 
   try {
-    const data = await fetch(
-      `/api/match/${state.eventLeague}/${state.eventId}`
-    ).then(r => r.json());
-
-    if (data.error) { showError(data.error); return; }
+    const res  = await fetch(`/api/match/${currentLeague}/${selectedEventId}`);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
 
     renderScore(data.match, data.league_name);
-    renderStats(data.stat_rows);
-    renderKeyEvents(data.key_events);
-    appendCommentary(data.commentary, isFirstLoad);
+    renderStats(data);
+    renderKeyEvents(data.key_events || []);
+    appendCommentary(data.commentary || []);
+    updatePollBadge(data.match?.state === "in");
 
-    $("last-updated").textContent = "Updated " + stamp();
-    startPolling(data.poll_interval);
+    $("hero-section").classList.remove("hidden");
+    $("match-detail").classList.remove("hidden");
 
-  } catch (_) {
-    showError("Could not load match detail.");
+    clearMatchPolling();
+    const interval = (data.poll_interval || 300) * 1000;
+    matchPollTimer = setTimeout(() => loadMatchDetail(true), interval);
+  } catch (e) {
+    showError("Match detail error — " + e.message);
   } finally {
-    if (isFirstLoad) setLoading(false);
+    showSpinner(false);
   }
 }
 
-/* ── Score ─────────────────────────────────────────────────────── */
-function renderScore(m, leagueName) {
-  const isLive = m.state === "in";
+// ── Score Hero ─────────────────────────────────────────────────────
 
-  $("live-chip").classList.toggle("hidden", !isLive);
-  $("match-clock").textContent = m.clock ? m.clock + "'" : "";
-  $("match-status-detail").textContent = m.status_detail || "";
-  $("league-badge").textContent = leagueName || "";
+function renderScore(match, leagueName) {
+  if (!match) return;
 
-  setTeam("home", m.home);
-  setTeam("away", m.away);
+  const isLive = match.state === "in";
+
+  $("home-name").textContent = match.home.name || "—";
+  $("away-name").textContent = match.away.name || "—";
+  $("stat-home-abbr").textContent = (match.home.short || match.home.name || "HME").substring(0, 3).toUpperCase();
+  $("stat-away-abbr").textContent = (match.away.short || match.away.name || "AWY").substring(0, 3).toUpperCase();
+
+  setLogo($("home-logo"), match.home.logo, match.home.name);
+  setLogo($("away-logo"), match.away.logo, match.away.name);
+
+  const hs = match.home.score ?? "—";
+  const as = match.away.score ?? "—";
+
+  if (lastHomeScore !== null && hs !== "—" && hs !== lastHomeScore) {
+    setScoreWithFlash($("home-score"), hs);
+    showGoalToast(`GOAL! ${match.home.name}  ${hs}–${as}`);
+  } else {
+    $("home-score").textContent = hs;
+  }
+
+  if (lastAwayScore !== null && as !== "—" && as !== lastAwayScore) {
+    setScoreWithFlash($("away-score"), as);
+    showGoalToast(`GOAL! ${hs}–${as}  ${match.away.name}`);
+  } else {
+    $("away-score").textContent = as;
+  }
+
+  lastHomeScore = hs;
+  lastAwayScore = as;
+
+  const liveChip  = $("live-chip");
+  const heroClock = $("hero-clock");
+  const heroStatus = $("hero-status");
+
+  liveChip.classList.toggle("hidden", !isLive);
+  if (isLive && match.clock) {
+    heroClock.textContent  = match.clock + "'";
+    heroStatus.textContent = "";
+  } else {
+    heroClock.textContent  = "";
+    heroStatus.textContent = match.status_detail || "";
+  }
+
+  const leagueEl = $("hero-league");
+  if (leagueEl) leagueEl.textContent = leagueName || "";
+
+  $("hero-updated").textContent = "Updated " + new Date().toLocaleTimeString();
 }
 
-function setTeam(side, team) {
-  $(`${side}-team`).textContent  = team.name  || "—";
-  $(`${side}-score`).textContent = team.score !== "" ? team.score : "—";
-  const logo = $(`${side}-logo`);
-  if (team.logo) { logo.src = team.logo; logo.alt = team.name; logo.style.display = ""; }
-  else { logo.style.display = "none"; }
+function setLogo(img, src, alt) {
+  if (src) {
+    img.src = src;
+    img.alt = alt || "";
+    img.style.display = "";
+  } else {
+    img.src = "";
+    img.style.display = "none";
+  }
 }
 
-/* ── Stats ─────────────────────────────────────────────────────── */
-function renderStats(rows) {
-  if (!rows || rows.length === 0) { $("stats-section").classList.add("hidden"); return; }
-  $("stats-section").classList.remove("hidden");
-  const strip = $("stats-strip");
-  strip.innerHTML = "";
+function setScoreWithFlash(el, value) {
+  el.textContent = value;
+  el.classList.remove("flashing");
+  void el.offsetWidth;
+  el.classList.add("flashing");
+  el.addEventListener("animationend", () => el.classList.remove("flashing"), { once: true });
+}
 
-  rows.forEach(r => {
-    // Parse possession-style floats (ESPN returns 53.3 for 53.3%)
-    const hRaw = parseFloat(r.home) || 0;
-    const aRaw = parseFloat(r.away) || 0;
-    const total = hRaw + aRaw || 1;
-    const hPct  = (hRaw / total * 50).toFixed(1);   // width as % of half
-    const aPct  = (aRaw / total * 50).toFixed(1);
+// ── Stats ──────────────────────────────────────────────────────────
 
-    const row = el("div");
-    row.innerHTML = `
+function renderStats(data) {
+  const rows    = data.stat_rows || [];
+  const match   = data.match    || {};
+  const content = $("stats-content");
+
+  if (!rows.length) {
+    content.innerHTML = `<div class="panel-empty">${
+      match.state === "pre"
+        ? "Stats available once the match kicks off."
+        : "No statistics available."
+    }</div>`;
+    return;
+  }
+
+  content.innerHTML = rows.map(row => {
+    const hv    = parseFloat(row.home) || 0;
+    const av    = parseFloat(row.away) || 0;
+    const total = hv + av;
+    const hw    = total > 0 ? Math.min(50, (hv / total) * 50) : 0;
+    const aw    = total > 0 ? Math.min(50, (av / total) * 50) : 0;
+
+    return `
       <div class="stat-row">
-        <div class="stat-val home">${r.home || "—"}</div>
+        <span class="stat-val home">${escHtml(String(row.home || "0"))}</span>
         <div>
-          <div class="stat-bar-wrap">
-            <div class="stat-bar-home" style="width:${hPct}%"></div>
-            <div class="stat-bar-away" style="width:${aPct}%"></div>
+          <div class="stat-bar-track">
+            <div class="stat-bar-home" style="width:${hw}%"></div>
+            <div class="stat-bar-away" style="width:${aw}%"></div>
           </div>
-          <div class="stat-label-row">${r.label}</div>
+          <div class="stat-label-wrap">${escHtml(row.label)}</div>
         </div>
-        <div class="stat-val away">${r.away || "—"}</div>
-      </div>`;
-    strip.appendChild(row);
-  });
+        <span class="stat-val away">${escHtml(String(row.away || "0"))}</span>
+      </div>
+    `;
+  }).join("");
 }
 
-/* ── Key Events ────────────────────────────────────────────────── */
-const KE_ICON = {
-  goal: `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" class="icon-goal"><circle cx="12" cy="12" r="10"/><path d="M12 2a10 10 0 1 0 0 20A10 10 0 0 0 12 2zm0 2c.88 0 1.72.12 2.52.34L12 7.27 9.48 4.34C10.28 4.12 11.12 4 12 4zm-4 1.27l2.97 4.08L7 10.9V8.6A8.03 8.03 0 0 1 8 5.27zm8 0A8.03 8.03 0 0 1 17 8.6v2.29l-3.97-1.54L14 5.27zM6.1 12.5 10 11l-1.28 4.3-2.44-1.62A8.03 8.03 0 0 1 6.1 12.5zm11.8 0a8.03 8.03 0 0 1-.18 1.18l-2.44 1.62L14 11l3.9 1.5zm-7.66 5.9L12 15.4l1.76 3.01A8.07 8.07 0 0 1 12 18.5a8.07 8.07 0 0 1-1.76-.1z" fill="rgba(0,0,0,.2)"/></svg>`,
-  yellow: `<svg width="12" height="15" viewBox="0 0 12 15" class="icon-card-y"><rect width="12" height="15" rx="2" fill="#f5a623"/></svg>`,
-  red:    `<svg width="12" height="15" viewBox="0 0 12 15" class="icon-card-r"><rect width="12" height="15" rx="2" fill="#ff3b30"/></svg>`,
-  sub:    `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="icon-sub"><path d="M17 3l4 4-4 4"/><path d="M21 7H9M7 21l-4-4 4-4"/><path d="M3 17h12"/></svg>`,
-  other:  `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="icon-other"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>`,
-};
+// ── Key Events ─────────────────────────────────────────────────────
 
-function renderKeyEvents(events) {
-  if (!events || events.length === 0) { $("key-events-section").classList.add("hidden"); return; }
-  $("key-events-section").classList.remove("hidden");
-  const list = $("key-events-list");
-  list.innerHTML = "";
+function renderKeyEvents(keyEvents) {
+  const container = $("events-content");
 
-  events.forEach(ke => {
-    const item = el("div", "key-event" + (ke.is_goal ? " is-goal" : ""));
+  if (!keyEvents.length) {
+    container.innerHTML = `<div class="panel-empty">Goals, cards and substitutions appear here during the match.</div>`;
+    return;
+  }
 
-    const icon = ke.is_goal   ? KE_ICON.goal
-               : ke.is_card && ke.type.includes("Yellow") ? KE_ICON.yellow
-               : ke.is_card   ? KE_ICON.red
-               : ke.is_sub    ? KE_ICON.sub
-               : KE_ICON.other;
+  container.innerHTML = keyEvents.map(ke => {
+    const isRedCard = ke.type.toLowerCase().includes("red");
+    const iconClass = ke.is_goal ? "goal"
+      : ke.is_card ? (isRedCard ? "card-r" : "card-y")
+      : ke.is_sub  ? "sub"
+      : "";
 
-    item.innerHTML = `
-      <div class="ke-clock">${ke.clock || ""}</div>
-      <div class="ke-icon">${icon}</div>
-      <div class="ke-text">${escText(ke.text)}</div>`;
-    list.appendChild(item);
-  });
+    return `
+      <div class="ke-item${ke.is_goal ? " is-goal" : ""}">
+        <span class="ke-clock">${escHtml(ke.clock || "")}</span>
+        <span class="ke-icon ${iconClass}" aria-hidden="true">${keIcon(ke)}</span>
+        <span class="ke-text">${escHtml(ke.text)}</span>
+      </div>
+    `;
+  }).join("");
 }
 
-/* ── Commentary (incremental) ──────────────────────────────────── */
-function appendCommentary(items, isFirstLoad) {
-  const feed    = $("commentary-feed");
-  const newItems = items.filter(c => c.sequence > state.lastCommentarySeq);
+function keIcon(ke) {
+  if (ke.is_goal) return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M12 7l2.5 5-2.5 4-2.5-4L12 7z"/></svg>`;
+  if (ke.is_card) return `<svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor"><rect width="10" height="14" rx="1.5"/></svg>`;
+  if (ke.is_sub)  return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><polyline points="7 16 2 12 7 8"/><polyline points="17 8 22 12 17 16"/></svg>`;
+  return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>`;
+}
+
+// ── Commentary ─────────────────────────────────────────────────────
+
+function appendCommentary(commentary) {
+  const feed = $("commentary-feed");
+
+  if (!commentary.length) {
+    feed.innerHTML = `<div class="feed-empty">
+      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      Commentary will appear here once the match starts.
+    </div>`;
+    updateCommentaryCount(0);
+    return;
+  }
+
+  const newItems = commentary.filter(c => c.sequence > lastCommentarySeq);
+
+  if (commentary.length > 0) {
+    const maxSeq = Math.max(...commentary.map(c => c.sequence));
+    if (maxSeq > lastCommentarySeq) lastCommentarySeq = maxSeq;
+  }
+
+  const isFirstLoad = !feed.querySelector(".commentary-card");
 
   if (isFirstLoad) {
     feed.innerHTML = "";
-    state.lastCommentarySeq = -1;
+    commentary.forEach(c => feed.appendChild(buildCommentaryCard(c)));
+  } else if (newItems.length) {
+    newItems.sort((a, b) => b.sequence - a.sequence);
+    newItems.forEach(c => feed.insertBefore(buildCommentaryCard(c), feed.firstChild));
+
+    const tabCount = $("tab-count");
+    if (tabCount) {
+      tabCount.classList.remove("hidden");
+      tabCount.textContent = `+${newItems.length}`;
+      setTimeout(() => tabCount.classList.add("hidden"), 4000);
+    }
   }
 
-  if (items.length === 0 && isFirstLoad) {
-    feed.innerHTML = `<div class="empty-state">
-      <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
-      <p>No commentary yet.</p></div>`;
-    return;
-  }
+  updateCommentaryCount(commentary.length);
+}
 
-  // On first load render all; on poll render only new
-  const toRender = isFirstLoad ? items : newItems;
-  if (toRender.length === 0) return;
+function buildCommentaryCard(c) {
+  const card = document.createElement("div");
+  card.className = "commentary-card";
+  card.dataset.seq = c.sequence;
 
-  const frag = document.createDocumentFragment();
-  toRender.forEach(item => {
-    const card = el("div", "commentary-card");
-    const timeDiv = el("div", "card-time", item.time || "");
-    const bodyDiv = el("div", "card-body");
-    const textEl  = el("p",   "card-text",  item.text);
-    const btn     = el("button", "btn-tweet");
-    btn.setAttribute("aria-label", "Tweet this update");
-    btn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" width="11" height="11"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-4.714-6.231-5.401 6.231H2.747l7.73-8.835L1.254 2.25H8.08l4.253 5.622 5.911-5.622zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>Tweet`;
-    btn.addEventListener("click", () => openModal(item.text, item.time));
-    bodyDiv.appendChild(textEl);
-    bodyDiv.appendChild(btn);
-    card.appendChild(timeDiv);
-    card.appendChild(bodyDiv);
-    frag.appendChild(card);
+  const timeEl = document.createElement("span");
+  timeEl.className = "c-time";
+  timeEl.textContent = c.time || "";
+
+  const body = document.createElement("div");
+  body.className = "c-body";
+
+  const text = document.createElement("p");
+  text.className = "c-text";
+  text.textContent = c.text;
+
+  const tweetBtn = document.createElement("button");
+  tweetBtn.className = "btn-tweet";
+  tweetBtn.setAttribute("aria-label", "Post this to X");
+  tweetBtn.innerHTML = `<svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+    <path d="M15.2 2h2.76l-6.02 6.88 7.08 9.37H13.47l-3.93-5.19-4.5 5.19H2.3l6.44-7.37L1.05 2H7.4l3.55 4.69L15.2 2Z"/>
+  </svg>Post`;
+
+  tweetBtn.addEventListener("click", () => openModal(c.text, c.time));
+
+  body.appendChild(text);
+  body.appendChild(tweetBtn);
+  card.appendChild(timeEl);
+  card.appendChild(body);
+
+  return card;
+}
+
+function updateCommentaryCount(n) {
+  const el = $("commentary-count");
+  if (el) el.textContent = n ? `${n} entries` : "";
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  GOAL TOAST
+// ═══════════════════════════════════════════════════════════════════
+
+let toastTimer = null;
+
+function showGoalToast(msg) {
+  const toast = $("goal-toast");
+  if (!toast) return;
+  if (toastTimer) clearTimeout(toastTimer);
+
+  toast.textContent = msg;
+  toast.classList.remove("hidden", "leaving");
+
+  toastTimer = setTimeout(() => {
+    toast.classList.add("leaving");
+    setTimeout(() => toast.classList.add("hidden"), 250);
+  }, 4500);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  MOBILE TAB BAR
+// ═══════════════════════════════════════════════════════════════════
+
+function wireTabBar() {
+  document.querySelectorAll(".tab-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const target = btn.dataset.tab;
+
+      document.querySelectorAll(".tab-btn").forEach(b => {
+        b.classList.toggle("active", b === btn);
+        b.setAttribute("aria-selected", b === btn ? "true" : "false");
+      });
+
+      const isMobile = window.innerWidth <= 768;
+      if (isMobile) {
+        const panelMap = {
+          stats:      $("stats-panel"),
+          events:     $("events-panel"),
+          commentary: $("commentary-panel"),
+        };
+        Object.entries(panelMap).forEach(([key, panel]) => {
+          if (panel) panel.style.display = key === target ? "block" : "none";
+        });
+      }
+
+      if (target === "commentary") {
+        const tabCount = $("tab-count");
+        if (tabCount) tabCount.classList.add("hidden");
+      }
+    });
   });
 
-  if (isFirstLoad) {
-    feed.appendChild(frag);
-  } else {
-    feed.insertBefore(frag, feed.firstChild); // new items at top
-  }
-
-  if (toRender.length > 0) {
-    state.lastCommentarySeq = Math.max(...toRender.map(c => c.sequence));
-  }
-
-  $("commentary-count").textContent =
-    feed.querySelectorAll(".commentary-card").length + " updates";
+  window.addEventListener("resize", () => {
+    if (window.innerWidth > 768) {
+      ["stats-panel", "events-panel", "commentary-panel"].forEach(id => {
+        const el = $(id);
+        if (el) el.style.display = "";
+      });
+    }
+  });
 }
 
-function escText(str) {
-  return str
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+// ═══════════════════════════════════════════════════════════════════
+//  TWEET MODAL
+// ═══════════════════════════════════════════════════════════════════
+
+function wireModalEvents() {
+  $("modal-close")?.addEventListener("click", closeModal);
+  $("modal-cancel")?.addEventListener("click", closeModal);
+  $("modal-post")?.addEventListener("click", postTweet);
+
+  $("tweet-modal")?.addEventListener("click", e => {
+    if (e.target === $("tweet-modal")) closeModal();
+  });
+
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape") closeModal();
+  });
 }
 
-/* ════════════════════════════════════════════════════════════════
-   TWEET MODAL
-   ════════════════════════════════════════════════════════════════ */
-let pendingText = "";
-
-function buildTweet(text, time) {
-  const tag    = " #FIFA2026 #Football ⚽";
-  const prefix = time ? `${time}' — ` : "";
-  const budget = TWEET_MAX - prefix.length - tag.length;
-  const body   = text.length > budget ? text.slice(0, budget - 1) + "…" : text;
-  return prefix + body + tag;
+function wireTweetTextarea() {
+  $("tweet-text")?.addEventListener("input", updateCharRing);
 }
 
 function openModal(text, time) {
-  const composed = buildTweet(text, time);
-  pendingText    = composed;
-  const ta       = $("tweet-text");
-  ta.value       = composed;
-  updateCharUI(composed.length);
-  $("tweet-modal").classList.remove("hidden");
-  requestAnimationFrame(() => { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); });
+  const modal = $("tweet-modal");
+  const ta    = $("tweet-text");
+  if (!modal || !ta) return;
+
+  const prefix = time ? `${time}' — ` : "";
+  ta.value = (prefix + text).substring(0, MAX_TWEET_CHARS);
+  modal.classList.remove("hidden");
+  updateCharRing();
+  setTimeout(() => ta.focus(), 50);
 }
 
 function closeModal() {
-  $("tweet-modal").classList.add("hidden");
-  pendingText = "";
+  $("tweet-modal")?.classList.add("hidden");
 }
 
-function updateCharUI(len) {
-  const rem   = TWEET_MAX - len;
-  const el2   = $("char-count");
-  el2.textContent = rem;
-  el2.className   = "char-num" + (rem < 0 ? " over" : rem < 30 ? " warn" : "");
-  const offset    = RING_CIRC * (1 - Math.min(len / TWEET_MAX, 1));
-  const ring      = $("char-ring");
-  ring.style.strokeDashoffset = offset;
-  ring.style.stroke = rem < 0 ? "#ff3b30" : rem < 30 ? "#f5a623" : "#0071e3";
-}
-
-$("tweet-text").addEventListener("input", function () {
-  pendingText = this.value;
-  updateCharUI(this.value.length);
-});
-$("tweet-modal").addEventListener("click", e => { if (e.target === $("tweet-modal")) closeModal(); });
-document.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
-$("modal-close").addEventListener("click",  closeModal);
-$("modal-cancel").addEventListener("click", closeModal);
-$("modal-post").addEventListener("click", () => {
-  const text = $("tweet-text").value.trim();
+function postTweet() {
+  const text = ($("tweet-text")?.value || "").trim();
   if (!text) return;
-  window.open("https://twitter.com/intent/tweet?text=" + encodeURIComponent(text), "_blank", "noopener,width=600,height=520");
+  const url = "https://twitter.com/intent/tweet?text=" + encodeURIComponent(text);
+  window.open(url, "_blank", "noopener,noreferrer,width=550,height=420");
   closeModal();
-});
+}
 
-/* ════════════════════════════════════════════════════════════════
-   REFRESH BUTTON  — reloads scoreboard, re-fetches current match
-   ════════════════════════════════════════════════════════════════ */
-$("refresh-btn").addEventListener("click", () => {
-  stopPolling();
-  state.lastCommentarySeq = -1;
-  loadScoreboard();
-  if (state.eventId) loadMatchDetail(true);
-});
+function updateCharRing() {
+  const ta      = $("tweet-text");
+  const ring    = $("char-ring");
+  const counter = $("char-count");
+  if (!ta || !ring || !counter) return;
 
-/* ════════════════════════════════════════════════════════════════
-   INIT
-   ════════════════════════════════════════════════════════════════ */
-(async () => {
-  await loadLeagues();
-  await loadScoreboard();
-})();
+  const used   = ta.value.length;
+  const left   = MAX_TWEET_CHARS - used;
+  const offset = CIRCUMFERENCE * (1 - used / MAX_TWEET_CHARS);
+
+  ring.style.strokeDashoffset = offset;
+  ring.style.stroke = left < 0 ? "var(--red)" : left < 20 ? "var(--gold)" : "var(--blue)";
+
+  counter.textContent = left;
+  counter.className   = "char-num" + (left < 0 ? " over" : left < 20 ? " warn" : "");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  UTILITIES
+// ═══════════════════════════════════════════════════════════════════
+
+function wireRefreshButton() {
+  $("refresh-btn")?.addEventListener("click", () => {
+    if (isRefreshing) return;
+    if (selectedEventId) loadMatchDetail();
+    else loadScoreboard();
+  });
+}
+
+function showSpinner(on) {
+  isRefreshing = on;
+  $("spinner")?.classList.toggle("hidden", !on);
+  $("refresh-icon")?.classList.toggle("hidden", on);
+  const btn = $("refresh-btn");
+  if (btn) btn.disabled = on;
+}
+
+function updatePollBadge(hasLive) {
+  $("poll-badge")?.classList.toggle("hidden", !hasLive);
+}
+
+function showError(msg) {
+  const el = $("error-banner");
+  if (!el) return;
+  el.setAttribute("data-msg", msg);
+  el.classList.remove("hidden");
+}
+
+function clearError() {
+  $("error-banner")?.classList.add("hidden");
+}
+
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function clearScoreboardPolling() {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+}
+
+function clearMatchPolling() {
+  if (matchPollTimer) { clearTimeout(matchPollTimer); matchPollTimer = null; }
+}
